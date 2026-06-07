@@ -1,0 +1,2 @@
+# Empty CMake include file for GNSS Pipeline
+# Add custom CMake configuration here if needed

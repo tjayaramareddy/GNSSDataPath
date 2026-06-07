@@ -1,0 +1,41 @@
+/**
+ * @file LatencyMonitor.lf
+ * @brief End-to-end latency and jitter monitoring
+ * @date 2026-05-13
+ * 
+ */
+target C
+
+preamble {=
+  #include "gnss_common.h"
+=}
+
+/**
+ * Latency Monitor Reactor
+ *
+ * Monitors end-to-end latency and logical/physical time jitter.
+ */
+reactor LatencyMonitor {
+  input data: data_packet_t
+  
+  state first_event: bool = true
+  state start_time: instant_t
+  
+  reaction(data) {=
+    if (self->first_event) {
+      self->start_time = lf_time_physical();
+      self->first_event = false;
+    }
+    
+    instant_t current_time = lf_time_logical();
+    instant_t generation_time = data->value.generation_time;
+    interval_t latency = current_time - generation_time;
+    
+    instant_t now_physical = lf_time_physical();
+    instant_t now_logical = lf_time_logical();
+    interval_t jitter = now_physical - now_logical;
+    
+    printf("[t=%lld ms] Monitor: Latency: %.3f ms, Jitter: %lld μs\n", 
+           lf_time_logical() / MSEC(1), latency / 1000.0, jitter / 1000);
+  =}
+}

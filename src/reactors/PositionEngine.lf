@@ -1,0 +1,125 @@
+/**
+ * Position Engine Reactor
+ *
+ * SoC-side processing that calculates position from RTCM data.
+ * Tracks end-to-end latency from GNSS generation to reception.
+ */
+
+target C
+
+preamble {=
+  #include "gnss_common.h"
+=}
+
+reactor PositionEngine {
+  input rtcm_stream: data_packet_t
+  logical action processing_complete: data_packet_t
+  
+  state position_x: double = 0.0
+  state position_y: double = 0.0
+  state last_update: time = 0
+  state total_latency: interval_t = 0
+  state packet_count: int = 0
+  state min_latency: interval_t = 0
+  state max_latency: interval_t = 0
+  state min_processing_ms: int = 10   // Minimum processing time (low CPU load)
+  state max_processing_ms: int = 50   // Maximum processing time (high CPU load)
+  
+  // Deadline violation tracking
+  state deadline_misses: int = 0
+  state total_processing_tasks: int = 0
+  
+  // Watchdog monitoring
+  state watchdog_triggers: int = 0
+  state last_watchdog_time: instant_t = 0
+  
+  // Logical vs Physical Time Tracking
+  state execution_lag_sum: int64_t = 0
+  state execution_lag_count: int = 0
+  state max_execution_lag: interval_t = 0
+  state min_execution_lag: interval_t = 0
+  
+  // LF WATCHDOG: Detects hung computation (no activity for 150ms)
+  timer position_watchdog_timer(150 msec)
+  
+  reaction(position_watchdog_timer) {=
+    self->watchdog_triggers++;
+    instant_t now = lf_time_logical();
+    interval_t since_last = (self->last_watchdog_time > 0) ? 
+                             (now - self->last_watchdog_time) : 0;
+    
+    self->last_watchdog_time = now;
+  =}
+  
+  reaction(rtcm_stream) -> processing_complete {=
+    self->total_processing_tasks++;
+    
+    // LF TIME TRACKING: Capture time at reaction entry
+    instant_t logical = lf_time_logical();
+    instant_t physical = lf_time_physical();
+    interval_t lag = physical - logical;
+    
+    // Track execution lag statistics
+    self->execution_lag_sum += lag;
+    self->execution_lag_count++;
+    
+    if (lag > self->max_execution_lag) {
+      self->max_execution_lag = lag;
+    }
+    if (self->min_execution_lag == 0 || lag < self->min_execution_lag) {
+      self->min_execution_lag = lag;
+    }
+
+    // Variable CPU load: simulate random processing time (10-50 ms)
+    int processing_ms = self->min_processing_ms + 
+                        (rand() % (self->max_processing_ms - self->min_processing_ms + 1));
+    interval_t processing_delay = MSEC(processing_ms);
+ 
+    lf_schedule_copy(processing_complete, processing_delay, &rtcm_stream->value, 1);
+  =} deadline(60 msec) {=
+    self->deadline_misses++;
+    interval_t elapsed = lf_time_physical() - lf_time_logical();   
+  =}
+  
+  reaction(processing_complete) {=
+    // LF TIME TRACKING: Measure execution lag at completion
+    instant_t logical_now = lf_time_logical();
+    instant_t physical_now = lf_time_physical();
+    interval_t completion_lag = physical_now - logical_now;
+    
+    interval_t elapsed = logical_now - self->last_update;
+    instant_t current_time = lf_time_logical();
+    instant_t generation_time = processing_complete->value.generation_time;
+    interval_t latency = current_time - generation_time;
+    
+    self->packet_count++;
+    self->total_latency += latency;
+    
+    if (self->packet_count == 1 || latency < self->min_latency) {
+      self->min_latency = latency;
+    }
+    if (self->packet_count == 1 || latency > self->max_latency) {
+      self->max_latency = latency;
+    }
+    
+    interval_t avg_latency = self->total_latency / self->packet_count;
+    
+    // Simulate position calculation result
+    self->position_x += 0.1;
+    self->position_y += 0.05;
+
+    self->last_update = lf_time_logical();
+  =} deadline(60 msec) {=
+    // LF DEADLINE HANDLER: Processing completion took too long
+    self->deadline_misses++;
+    interval_t elapsed = lf_time_physical() - lf_time_logical();
+  =}
+  
+  reaction(shutdown) {=
+    if (self->execution_lag_count > 0) {
+      double avg_lag = (double)self->execution_lag_sum / self->execution_lag_count;
+      // Schedulability analysis
+      double utilization = avg_lag / 100000.0;  // Assume 100ms period
+      }
+  =}
+}

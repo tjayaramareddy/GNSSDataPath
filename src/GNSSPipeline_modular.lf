@@ -1,0 +1,40 @@
+/**
+ * GNSS Positioning Pipeline - Federated Lingua Franca Model
+ * 
+ */
+target C {
+  tracing: true,
+  logging: "warn",
+  keepalive: true,
+  coordination: decentralized,
+  coordination-options: {
+    advance-message-interval: 10 msec
+  },
+  files: ["include/gnss_common.h"],
+  cmake-include: "cmake-include.txt"
+}
+
+import MCU from "reactors/MCU.lf"
+import PositionEngine from "reactors/PositionEngine.lf"
+import LatencyMonitor from "reactors/LatencyMonitor.lf"
+
+preamble {=
+  #include "gnss_common.h"
+=}
+
+/**
+ * Federated GNSS Pipeline
+ *
+ * Three federates:
+ * - mcu: Data collection (GNSSReceiver, UARTDriver, DataForwarder)
+ * - soc: Position calculation (PositionEngine)
+ * - monitor: Latency monitoring (LatencyMonitor)
+ */
+federated reactor GNSSPipeline_modular {
+  mcu = new MCU()
+  soc = new PositionEngine()
+  monitor = new LatencyMonitor()
+  
+  mcu.to_network -> soc.rtcm_stream
+  mcu.to_network -> monitor.data
+}

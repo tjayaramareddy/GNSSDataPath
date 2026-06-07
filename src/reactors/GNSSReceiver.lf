@@ -1,0 +1,247 @@
+/**
+ * @file GNSSReceiver.lf
+ * @brief GNSS receiver generating RTCM3 correction data packets
+ * @date 2026-05-13
+ */
+target C
+
+preamble {=
+  #include "gnss_common.h"
+  #include <stdlib.h>
+  #include <string.h>
+  #include <time.h>
+
+  // Lightweight 24-bit checksum (not RTCM CRC24Q), used for simulation.
+  static inline uint32_t simple_crc24(const uint8_t* data, int len) {
+    uint32_t crc = 0x00ABCDEF;
+    for (int i = 0; i < len; i++) {
+      crc ^= data[i];
+      crc = ((crc << 5) | (crc >> 19)) & 0xFFFFFF;
+      crc = (crc + 0x1F3D5B) & 0xFFFFFF;
+    }
+    return crc & 0xFFFFFF;
+  }
+
+  // Simple CRC-32 (IEEE) for E2E header CRC field.
+  static inline uint32_t crc32_ieee_update(uint32_t crc, const uint8_t* data, int len) {
+    for (int i = 0; i < len; i++) {
+      crc ^= data[i];
+      for (int b = 0; b < 8; b++) {
+        uint32_t mask = (uint32_t)(-(int32_t)(crc & 1U));
+        crc = (crc >> 1) ^ (0xEDB88320U & mask);
+      }
+    }
+    return crc;
+  }
+
+  static inline uint32_t compute_e2e_crc(const data_packet_t* packet) {
+    uint32_t crc = 0xFFFFFFFFU;
+
+    // Include E2E Length, Counter, and Data ID (bytes 4..11).
+    crc = crc32_ieee_update(crc, &packet->data[4], 8);
+
+    // Skip E2E CRC field (bytes 12..15), then include full RTCM payload.
+    if (packet->bytes > E2E_HEADER_SIZE) {
+      crc = crc32_ieee_update(crc, &packet->data[E2E_HEADER_SIZE],
+                              packet->bytes - E2E_HEADER_SIZE);
+    }
+
+    return ~crc;
+  }
+
+  /*
+   * Packet format emitted by GNSSReceiver (byte stream over UART):
+   *
+   *   +------------------------------ E2E Header (16 bytes) ------------------------------+
+  *   | B0..B3  | B4..B5       | B6..B7      | B8..B11      | B12..B15                    |
+  *   | Preamble| E2E Length   | E2E Counter | E2E Data ID  | E2E CRC (CRC-32)            |
+  *   |0F F0 5A | Total packet | Big-endian  | Big-endian   | over [B4..B11]+payload      |
+   *   |03       | bytes (BE)   |             |              |                             |
+   *   +-----------------------------------------------------------------------------------+
+   *   +--------------------------- Payload: RTCM3 messages -------------------------------+
+   *   | RTCM #1 | RTCM #2 | ... | RTCM #N                                                |
+   *   +-----------------------------------------------------------------------------------+
+   *
+   *   Each RTCM3 message encoded as:
+   *     +--------------------+----------------------+--------------------+-----------+
+   *     | Byte 0             | Bytes 1..2           | Bytes 3..(3+L-1)   | Last 3    |
+   *     | RTCM preamble 0xD3 | RTCM content len L   | RTCM content       | CRC bytes |
+   *     |                    | (10-bit, BE fields)  | (message id starts | (modeled  |
+   *     |                    |                      | at first 2 bytes)  | placeholder)
+   *     +--------------------+----------------------+--------------------+-----------+
+   */
+static inline void build_demo_gnss_packet(data_packet_t* packet,
+                                            uint16_t e2e_counter,
+                                            uint32_t data_id,
+                                            int rtcm_count,
+                                            int target_total_bytes,
+                                            instant_t generation_time) {
+    // Start from a clean packet buffer.
+    memset(packet, 0, sizeof(*packet));
+    packet->generation_time = generation_time;
+    packet->packet_info.e2e_counter = e2e_counter;
+    packet->packet_info.e2e_data_id = data_id;
+
+    // Keep requested RTCM count within supported bounds.
+    if (rtcm_count < 1) {
+      rtcm_count = 1;
+    }
+    if (rtcm_count > MAX_RTCM_MESSAGES_PER_PACKET) {
+      rtcm_count = MAX_RTCM_MESSAGES_PER_PACKET;
+    }
+
+    // Ensure packet size can hold E2E header and all RTCM message overhead.
+    int min_total = E2E_HEADER_SIZE + rtcm_count * (RTCM3_OVERHEAD + 2);
+    if (target_total_bytes < min_total) {
+      target_total_bytes = min_total;
+    }
+    if (target_total_bytes > MAX_PACKET_SIZE) {
+      target_total_bytes = MAX_PACKET_SIZE;
+    }
+
+    // Write fixed E2E header fields.
+    packet->data[0] = E2E_PREAMBLE_0;
+    packet->data[1] = E2E_PREAMBLE_1;
+    packet->data[2] = E2E_PREAMBLE_2;
+    packet->data[3] = E2E_PREAMBLE_3;
+    packet->data[6] = (uint8_t)((e2e_counter >> 8) & 0xFF);
+    packet->data[7] = (uint8_t)(e2e_counter & 0xFF);
+    packet->data[8] = (uint8_t)((data_id >> 24) & 0xFF);
+    packet->data[9] = (uint8_t)((data_id >> 16) & 0xFF);
+    packet->data[10] = (uint8_t)((data_id >> 8) & 0xFF);
+    packet->data[11] = (uint8_t)(data_id & 0xFF);
+
+    // Payload starts right after the 16-byte E2E header.
+    int offset = E2E_HEADER_SIZE;
+
+    for (int i = 0; i < rtcm_count; i++) {
+      // Evenly distribute remaining bytes across remaining messages.
+      int remaining_msgs = rtcm_count - i;
+      int remaining_bytes = target_total_bytes - offset;
+      int bytes_this_msg = remaining_bytes / remaining_msgs;
+      if (bytes_this_msg < RTCM3_OVERHEAD + 2) {
+        bytes_this_msg = RTCM3_OVERHEAD + 2;
+      }
+
+      int content_length = bytes_this_msg - RTCM3_OVERHEAD;
+      uint16_t message_id = (uint16_t)(1000 + ((e2e_counter * 17 + i * 29) % 3000));
+
+      // RTCM header: preamble + 10-bit content length.
+      packet->data[offset] = RTCM3_PREAMBLE;
+      packet->data[offset + 1] = (uint8_t)((content_length >> 8) & 0x03);
+      packet->data[offset + 2] = (uint8_t)(content_length & 0xFF);
+
+      // First two content bytes encode the synthetic RTCM message ID.
+      packet->data[offset + 3] = (uint8_t)((message_id >> 4) & 0xFF);
+      packet->data[offset + 4] = (uint8_t)((message_id & 0x0F) << 4);
+
+      // Fill remaining content bytes with deterministic demo data.
+      for (int j = 2; j < content_length; j++) {
+        packet->data[offset + 3 + j] = (uint8_t)((e2e_counter + i + j) & 0xFF);
+      }
+
+      // Append simple 24-bit checksum over RTCM header + content.
+      uint32_t crc24 = simple_crc24(&packet->data[offset], RTCM3_HEADER_SIZE + content_length);
+      packet->data[offset + 3 + content_length] = (uint8_t)((crc24 >> 16) & 0xFF);
+      packet->data[offset + 4 + content_length] = (uint8_t)((crc24 >> 8) & 0xFF);
+      packet->data[offset + 5 + content_length] = (uint8_t)(crc24 & 0xFF);
+
+      offset += bytes_this_msg;
+    }
+
+    // Finalize packet size fields and summary metadata.
+    packet->bytes = offset;
+    packet->packet_info.e2e_length = (uint16_t)offset;
+    packet->data[4] = (uint8_t)((offset >> 8) & 0xFF);
+    packet->data[5] = (uint8_t)(offset & 0xFF);
+
+    // Compute and write E2E CRC to bytes 12..15.
+    uint32_t e2e_crc = compute_e2e_crc(packet);
+    packet->data[12] = (uint8_t)((e2e_crc >> 24) & 0xFF);
+    packet->data[13] = (uint8_t)((e2e_crc >> 16) & 0xFF);
+    packet->data[14] = (uint8_t)((e2e_crc >> 8) & 0xFF);
+    packet->data[15] = (uint8_t)(e2e_crc & 0xFF);
+
+    packet->packet_info.rtcm_count = rtcm_count;
+  }
+=}
+
+reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
+                     max_bytes: int = 800,  // Quad-constellation maximum
+                     min_e2e_messages_per_epoch: int = 1,
+                     max_e2e_messages_per_epoch: int = 4,
+                     min_rtcm_messages_per_e2e: int = 1,
+                     max_rtcm_messages_per_e2e: int = 6,
+                     inter_e2e_spacing_us: int = 25000
+) {
+  output rtcm: data_packet_t
+  logical action emit_e2e: data_packet_t
+  timer epoch(0, 100 msec)
+  
+  state epoch_count: int = 0
+  state e2e_counter: int = 0
+  
+  reaction(startup) {=
+    srand(time(NULL));
+  =}
+  
+  reaction(epoch) -> emit_e2e {=
+    self->epoch_count++;
+
+    int min_e2e = self->min_e2e_messages_per_epoch;
+    int max_e2e = self->max_e2e_messages_per_epoch;
+    if (min_e2e < 1) {
+      min_e2e = 1;
+    }
+    if (max_e2e < min_e2e) {
+      max_e2e = min_e2e;
+    }
+
+    int e2e_messages_this_epoch = min_e2e +
+      (rand() % (max_e2e - min_e2e + 1));
+
+    printf("[t=%lld ms] [EPOCH_%d] GNSS generated %d E2E messages\n",
+           lf_time_logical() / MSEC(1), self->epoch_count, e2e_messages_this_epoch);
+
+    for (int i = 0; i < e2e_messages_this_epoch; i++) {
+      self->e2e_counter++;
+
+      int min_rtcm = self->min_rtcm_messages_per_e2e;
+      int max_rtcm = self->max_rtcm_messages_per_e2e;
+      if (min_rtcm < 1) {
+        min_rtcm = 1;
+      }
+      if (max_rtcm < min_rtcm) {
+        max_rtcm = min_rtcm;
+      }
+
+      int rtcm_count = min_rtcm +
+        (rand() % (max_rtcm - min_rtcm + 1));
+
+      data_packet_t packet;
+      int bytes_this_e2e = self->min_bytes + (rand() % (self->max_bytes - self->min_bytes + 1));
+
+      build_demo_gnss_packet(&packet,
+                             (uint16_t)self->e2e_counter,
+                             0x474E5353,
+                             rtcm_count,
+                             bytes_this_e2e,
+                             lf_time_logical());
+
+      interval_t delay = USEC(i * self->inter_e2e_spacing_us);
+      lf_schedule_copy(emit_e2e, delay, &packet, 1);
+
+      printf("[t=%lld ms]   E2E#%d scheduled (+%d us): %d bytes, %d RTCM3 messages\n",
+             lf_time_logical() / MSEC(1),
+             self->e2e_counter,
+             i * self->inter_e2e_spacing_us,
+             packet.bytes,
+             packet.packet_info.rtcm_count);
+    }
+  =}
+
+  reaction(emit_e2e) -> rtcm {=
+    // Emit each E2E packet as a separate event. UARTDriver transmits bytes one-by-one.
+    lf_set(rtcm, emit_e2e->value);
+  =}
+}

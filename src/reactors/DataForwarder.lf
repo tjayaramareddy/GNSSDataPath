@@ -1,0 +1,180 @@
+/**
+ * @file DataForwarder.lf
+ * @brief Simple data forwarder with LF feature demonstration
+ * @date 2026-05-13
+ * 
+ */
+target C
+
+preamble {=
+  #include "gnss_common.h"
+=}
+
+/**
+ * DataForwarder Reactor
+ *
+ * Periodically forwards data from a ring buffer to the network.
+ * Tracks timing statistics and demonstrates LF real-time features.
+ */
+reactor DataForwarder {
+  input mem_in: data_packet_t
+  timer period(0, 18 msec)
+  output network_out: data_packet_t
+  
+  // Ring buffer state
+  state memory_buffer: uint8_t[1000]  // Conservative size - monitoring for overflow
+  state write_ptr: int = 0
+  state read_ptr: int = 0
+  state max_buffer_usage: int = 0
+  state earliest_gen_time: instant_t = 0
+  state has_data: bool = false
+  
+  // Message corruption tracking
+  state total_messages_received: int = 0
+  state total_messages_corrupted: int = 0
+  state last_packet_info: e2e_packet_info_t
+  
+  // Buffer overflow tracking
+  state buffer_overflow_events: int = 0
+  state total_bytes_dropped: int = 0
+  
+  // Statistics
+  state total_forwards: int = 0
+  state total_bytes_forwarded: int = 0
+  state forwarding_deadline_misses: int = 0
+  state forwarding_watchdog_triggers: int = 0
+  
+  // Timing tracking
+  state max_execution_lag: interval_t = 0
+  state last_logical_time: instant_t = 0
+  state last_physical_time: instant_t = 0
+  
+  // LF WATCHDOG: Detects if periodic forwarding hangs
+  watchdog forwarding_watchdog(100 msec) {=
+    self->forwarding_watchdog_triggers++;
+    printf("\n[t=%lld ms] WATCHDOG: DataForwarder not executing (trigger #%d)\n",
+           lf_time_logical() / MSEC(1), self->forwarding_watchdog_triggers);
+  =}
+  
+  reaction(startup) {=
+    printf("[INIT] DataForwarder: period=18ms, deadline=20ms, watchdog=100ms\n");
+  =}
+  
+  reaction(mem_in) {=
+    int bytes_to_write = mem_in->value.bytes;
+    instant_t gen_time = mem_in->value.generation_time;
+    int buffer_size = MEM_BUFFER_SIZE;
+    
+    // Check if this is a complete packet with message metadata (from transmission end)
+    if (mem_in->value.packet_info.rtcm_count > 0) {
+      int complete_count = 0;
+      int corrupted_count = 0;
+      
+      // Store packet info for shutdown report
+      self->last_packet_info = mem_in->value.packet_info;
+    }
+    
+    // Track earliest generation time for end-to-end latency
+    if (!self->has_data || gen_time < self->earliest_gen_time) {
+      self->earliest_gen_time = gen_time;
+      self->has_data = true;
+    }
+    
+    // Calculate available space in ring buffer
+    int available = (self->write_ptr >= self->read_ptr) ?
+                    (buffer_size - self->write_ptr + self->read_ptr) :
+                    (self->read_ptr - self->write_ptr);
+    
+    if (bytes_to_write <= available) {
+      // Update write pointer (simplified model - actual data copy abstracted)
+      self->write_ptr = (self->write_ptr + bytes_to_write) % buffer_size;
+      
+      // Calculate current buffer occupancy
+      int current_usage = (self->write_ptr >= self->read_ptr) ?
+                          (self->write_ptr - self->read_ptr) :
+                          (buffer_size - self->read_ptr + self->write_ptr);
+      
+      if (current_usage > self->max_buffer_usage) {
+        self->max_buffer_usage = current_usage;
+      }
+      
+      printf("[t=%lld ms] Buffer: +%d bytes (occupancy=%d)\n",
+             lf_time_logical() / MSEC(1), bytes_to_write, current_usage);
+    } else {
+      // Buffer overflow - track for monitoring and analysis
+      self->buffer_overflow_events++;
+      self->total_bytes_dropped += bytes_to_write;
+      
+      // Use centralized formatting function
+      print_buffer_overflow(lf_time_logical() / MSEC(1), bytes_to_write, available,
+                           MEM_BUFFER_SIZE, self->buffer_overflow_events,
+                           self->total_bytes_dropped);
+    }
+  =}
+  
+  reaction(period) -> network_out {=
+    // LF TIME TRACKING: Measure execution lag
+    instant_t logical_now = lf_time_logical();
+    instant_t physical_now = lf_time_physical();
+    interval_t execution_lag = physical_now - logical_now;
+    
+    if (execution_lag > self->max_execution_lag) {
+      self->max_execution_lag = execution_lag;
+    }
+    
+    self->last_logical_time = logical_now;
+    self->last_physical_time = physical_now;
+    
+    int buffer_size = MEM_BUFFER_SIZE;
+    int available_data;
+    
+    // Calculate available data in ring buffer
+    if (self->write_ptr >= self->read_ptr) {
+      available_data = self->write_ptr - self->read_ptr;
+    } else {
+      available_data = buffer_size - self->read_ptr + self->write_ptr;
+    }
+    
+    if (available_data > 0 && self->has_data) {
+      // Forward all available data
+      self->total_forwards++;
+      self->total_bytes_forwarded += available_data;
+      
+      // Preserve earliest generation timestamp for end-to-end latency measurement
+      data_packet_t out_packet = {
+        .bytes = available_data, 
+        .generation_time = self->earliest_gen_time
+      };
+      
+      // Parse packet before sending on network output
+      int rtcm_count = parse_e2e_packet(&out_packet);
+      printf("[t=%lld ms] Parsed outgoing packet: %d RTCM3 messages\n",
+             lf_time_logical() / MSEC(1), rtcm_count);
+      
+      lf_set(network_out, out_packet);
+      
+      printf("[t=%lld ms] Forward: %d bytes to network (total: %d forwards, %d bytes)\n",
+             lf_time_logical() / MSEC(1), available_data, 
+             self->total_forwards, self->total_bytes_forwarded);
+      
+      // Drain ring buffer
+      self->read_ptr = (self->read_ptr + available_data) % buffer_size;
+      if (self->read_ptr == self->write_ptr) {
+        self->has_data = false;
+      }
+    } else {
+      printf("[t=%lld ms] Forward: idle (no data)\n", lf_time_logical() / MSEC(1));
+    }
+  =} deadline(20 msec) {=
+    // LF DEADLINE HANDLER: Forwarding task exceeded deadline
+    self->forwarding_deadline_misses++;
+    interval_t lag = lf_time_physical() - lf_time_logical();
+    
+    printf("[t=%lld ms] DEADLINE VIOLATION: Exceeded 20ms (lag: %.3f ms, violation #%d)\n",
+           lf_time_logical() / MSEC(1), lag / 1000.0, self->forwarding_deadline_misses);
+  =}
+  
+  reaction(shutdown) {=
+    
+  =}
+}

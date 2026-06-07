@@ -1,0 +1,69 @@
+/**
+ * @file MCU.lf
+ * @brief Microcontroller composite reactor (GNSS + UART + TCP stack)
+ * @date 2026-05-13
+ * 
+ * DESCRIPTION:
+ * Composite reactor representing an embedded microcontroller unit (MCU) deployed
+ * on a vehicle. Combines three components into a single federate that models the
+ * complete data acquisition and forwarding pipeline on the embedded side.
+ * 
+ * COMPONENTS:
+ * 1. GNSSReceiver - Hardware GNSS module (10 Hz RTCM3 output)
+ * 2. UARTDriver - Serial communication with interrupt handling
+ * 3. DataForwarder - TCP/IP network stack with reliability
+ * 
+ * ARCHITECTURE:
+ * ```
+ * MCU Federate
+ * ┌─────────────────────────────────────┐
+ * │  [GNSS] → [UART] → [TCP Forwarder] │
+ * │   100ms    Serial      Network      │
+ * └─────────────────────────────────────┘
+ *          ↓ (network) ↓
+ *     [Position Engine on SoC]
+ * ```
+ * 
+ * DEPLOYMENT:
+ * - Runs as single federate in distributed system
+ * - Represents resource-constrained embedded hardware
+ * - Communicates with SoC federate via RTI coordination
+ * 
+ * CONNECTIONS:
+ * - Internal: receiver → uart → forwarder (data pipeline)
+ * - External: forwarder.tcp_out → Network → SoC (federated output)
+ * 
+ * DESIGN RATIONALE:
+ * Grouping these reactors into a composite federate mirrors real deployment
+ * where GNSS, UART, and network stack all run on the same embedded processor.
+ * This allows realistic modeling of resource sharing and timing constraints
+ * on the MCU platform.
+ */
+target C
+
+import GNSSReceiver from "GNSSReceiver.lf"
+import UARTDriver from "UARTDriver.lf"
+import DataForwarder from "DataForwarder.lf"
+
+preamble {=
+  #include "gnss_common.h"
+=}
+
+/**
+ * MCU Composite Reactor
+ *
+ * Microcontroller unit that collects GNSS data and forwards it to the SoC.
+ *
+ * Pipeline: GNSSReceiver (100ms) -> UARTDriver (interrupt) -> DataForwarder (18ms) -> Network
+ */
+reactor MCU {
+  output to_network: data_packet_t
+  
+  gnss = new GNSSReceiver()
+  uart = new UARTDriver()
+  forwarder = new DataForwarder()
+  
+  gnss.rtcm -> uart.rtcm_in
+  uart.uart_out -> forwarder.mem_in
+  forwarder.network_out -> to_network
+}
