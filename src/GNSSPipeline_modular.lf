@@ -10,7 +10,7 @@ target C {
   coordination-options: {
     advance-message-interval: 10 msec
   },
-  files: ["include/gnss_common.h"],
+  files: ["../include/gnss_common.h"],
   cmake-include: "cmake-include.txt"
 }
 
