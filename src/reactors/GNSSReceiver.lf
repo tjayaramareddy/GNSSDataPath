@@ -176,6 +176,7 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
 ) {
   output rtcm: data_packet_t
   logical action emit_e2e: data_packet_t
+  logical action emit_byte: data_packet_t
   timer epoch(0, 100 msec)
   
   state epoch_count: int = 0
@@ -240,8 +241,20 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
     }
   =}
 
-  reaction(emit_e2e) -> rtcm {=
-    // Emit each E2E packet as a separate event. UARTDriver transmits bytes one-by-one.
-    lf_set(rtcm, emit_e2e->value);
+  reaction(emit_e2e) -> emit_byte {=
+    // Re-emit each E2E payload as one-byte packets so downstream sees one byte per event.
+    const data_packet_t* in = &emit_e2e->value;
+    for (int i = 0; i < in->bytes; i++) {
+      data_packet_t byte_packet = {0};
+      byte_packet.bytes = 1;
+      byte_packet.data[0] = in->data[i];
+      byte_packet.generation_time = in->generation_time;
+      lf_schedule_copy(emit_byte, USEC(i), &byte_packet, 1);
+    }
+  =}
+
+  reaction(emit_byte) -> rtcm {=
+    // Forward one-byte packet to UARTDriver.
+    lf_set(rtcm, emit_byte->value);
   =}
 }
