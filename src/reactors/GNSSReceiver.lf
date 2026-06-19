@@ -11,7 +11,17 @@ preamble {=
   #include <string.h>
   #include <time.h>
 
-  // Lightweight 24-bit checksum (not RTCM CRC24Q), used for simulation.
+  /**
+   * @brief Compute a lightweight 24-bit checksum over a byte buffer.
+   *
+   * This is a non-standard CRC-24 variant used for simulation purposes only.
+   * It is NOT the RTCM CRC-24Q algorithm; it is faster and sufficient for
+   * detecting accidental corruption in synthetic test data.
+   *
+   * @param data  Pointer to the input byte buffer.
+   * @param len   Number of bytes to checksum.
+   * @return      24-bit checksum value (upper 8 bits are always zero).
+   */
   static inline uint32_t simple_crc24(const uint8_t* data, int len) {
     uint32_t crc = 0x00ABCDEF;
     for (int i = 0; i < len; i++) {
@@ -22,18 +32,23 @@ preamble {=
     return crc & 0xFFFFFF;
   }
 
-  // Simple CRC-32 (IEEE) for E2E header CRC field.
-  static inline uint32_t crc32_ieee_update(uint32_t crc, const uint8_t* data, int len) {
-    for (int i = 0; i < len; i++) {
-      crc ^= data[i];
-      for (int b = 0; b < 8; b++) {
-        uint32_t mask = (uint32_t)(-(int32_t)(crc & 1U));
-        crc = (crc >> 1) ^ (0xEDB88320U & mask);
-      }
-    }
-    return crc;
-  }
-
+  /**
+   * @brief Compute the CRC-32 (IEEE 802.3) integrity field for an E2E packet.
+   *
+   * The CRC covers the following fields of the E2E header and payload:
+   *   - Bytes 4..5  : E2E Length
+   *   - Bytes 6..7  : E2E Counter
+   *   - Bytes 8..11 : E2E Data ID
+   *   - Bytes 16..N : Full RTCM3 payload (everything after the E2E header)
+   *
+   * Bytes 0..3 (preamble) and 12..15 (the CRC field itself) are excluded.
+   * The result is written big-endian into bytes 12..15 of the packet by the
+   * caller (@see build_demo_gnss_packet).
+   *
+   * @param packet  Pointer to the fully populated packet whose CRC is to be computed.
+   *                Must have @c packet->bytes >= E2E_HEADER_SIZE.
+   * @return        32-bit CRC value (finalised with bitwise NOT per IEEE 802.3).
+   */
   static inline uint32_t compute_e2e_crc(const data_packet_t* packet) {
     uint32_t crc = 0xFFFFFFFFU;
 
@@ -166,13 +181,44 @@ static inline void build_demo_gnss_packet(data_packet_t* packet,
   }
 =}
 
+/**
+ * @reactor GNSSReceiver
+ * @brief Simulates a GNSS hardware module producing RTCM3 correction data packets.
+ *
+ * On every 100 ms epoch timer tick, exactly one E2E packet is generated and
+ * scheduled for byte-by-byte emission at the configured baud rate.  Each E2E
+ * packet contains a 16-byte integrity header (preamble, length, counter, data ID,
+ * CRC-32) followed by 1–6 RTCM3 messages.  Bytes are emitted individually via
+ * the @c emit_byte logical action so that @c UARTDriver receives one byte per
+ * event, faithfully modelling the byte-serial nature of a physical UART link.
+ *
+ * The reactor drives a three-phase simulation:
+ *   - Phase 1 (@c convergence_epochs): AIMD adaptive algorithm learns the safe
+ *     ISR latency ceiling; overflows are expected.
+ *   - Phase 2 (@c validation_epochs): system runs at the converged ceiling;
+ *     zero overflows expected.
+ *   - Phase 3 (@c sweep_epochs): structured threshold sweep across all boundary
+ *     values to experimentally verify the safety formula.
+ *
+ * @param min_bytes                   Minimum total packet size in bytes (dual-constellation baseline).
+ * @param max_bytes                   Maximum total packet size in bytes (quad-constellation maximum).
+ * @param min_rtcm_messages_per_e2e   Minimum number of RTCM3 messages per E2E packet.
+ * @param max_rtcm_messages_per_e2e   Maximum number of RTCM3 messages per E2E packet.
+ * @param baudrate                    Serial baud rate (bits/s); must match @c UARTDriver.
+ *                                    Controls the byte-emission interval:
+ *                                    byte_time = 10 × 10⁶ / baudrate µs.
+ * @param convergence_epochs          Number of epochs in Phase 1 (AIMD convergence).
+ * @param validation_epochs           Number of epochs in Phase 2 (zero-overflow validation).
+ * @param sweep_epochs                Number of epochs in Phase 3 (threshold sweep); 0 disables.
+ */
 reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
                      max_bytes: int = 800,  // Quad-constellation maximum
-                     min_e2e_messages_per_epoch: int = 1,
-                     max_e2e_messages_per_epoch: int = 4,
                      min_rtcm_messages_per_e2e: int = 1,
                      max_rtcm_messages_per_e2e: int = 6,
-                     inter_e2e_spacing_us: int = 25000
+                     baudrate: int = 460800,          // Must match UARTDriver baudrate
+                     convergence_epochs: int = 1000,   // Phase 1: adaptive learns safe ceiling
+                     validation_epochs: int = 1000,     // Phase 2: run at converged ceiling (expect 0 overflows)
+                     sweep_epochs: int = 800            // Phase 3: threshold sweep (0 = disabled)
 ) {
   output rtcm: data_packet_t
   logical action emit_e2e: data_packet_t
@@ -187,25 +233,33 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
   =}
   
   reaction(epoch) -> emit_e2e {=
+    int total_epochs = self->convergence_epochs + self->validation_epochs + self->sweep_epochs;
+    // Stop after all phases complete.
+    if (total_epochs > 0 && self->epoch_count >= total_epochs) {
+      printf("[t=%lld ms] [GNSS] All %d epochs done (%d convergence + %d validation + %d sweep) \u2014 requesting stop.\n",
+             lf_time_logical() / MSEC(1), total_epochs,
+             self->convergence_epochs, self->validation_epochs, self->sweep_epochs);
+      lf_request_stop();
+      return;
+    }
+    // Print phase boundary when entering validation phase.
+    if (self->epoch_count == self->convergence_epochs && self->convergence_epochs > 0) {
+      printf("\n\033[1;35m[t=%lld ms] *** PHASE 2 START: %d convergence epochs done."
+             " Running %d validation epochs at converged latency. Expect 0 overflows. ***\033[0m\n\n",
+             lf_time_logical() / MSEC(1), self->convergence_epochs, self->validation_epochs);
+    }
+    // Print phase boundary when entering sweep phase.
+    if (self->epoch_count == self->convergence_epochs + self->validation_epochs && self->sweep_epochs > 0) {
+      printf("\n\033[1;35m[t=%lld ms] *** PHASE 3 START: Threshold sweep (%d epochs). ***\033[0m\n\n",
+             lf_time_logical() / MSEC(1), self->sweep_epochs);
+    }
     self->epoch_count++;
 
-    int min_e2e = self->min_e2e_messages_per_epoch;
-    int max_e2e = self->max_e2e_messages_per_epoch;
-    if (min_e2e < 1) {
-      min_e2e = 1;
-    }
-    if (max_e2e < min_e2e) {
-      max_e2e = min_e2e;
-    }
+    printf("[t=%lld ms] [EPOCH_%d] GNSS generating 1 E2E message\n",
+           lf_time_logical() / MSEC(1), self->epoch_count);
 
-    int e2e_messages_this_epoch = min_e2e +
-      (rand() % (max_e2e - min_e2e + 1));
-
-    printf("[t=%lld ms] [EPOCH_%d] GNSS generated %d E2E messages\n",
-           lf_time_logical() / MSEC(1), self->epoch_count, e2e_messages_this_epoch);
-
-    for (int i = 0; i < e2e_messages_this_epoch; i++) {
-      self->e2e_counter++;
+    {
+      self->e2e_counter = (self->e2e_counter + 1) & 0xFFFF;  // 16-bit wrap: 65535 -> 0
 
       int min_rtcm = self->min_rtcm_messages_per_e2e;
       int max_rtcm = self->max_rtcm_messages_per_e2e;
@@ -229,32 +283,56 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
                              bytes_this_e2e,
                              lf_time_logical());
 
-      interval_t delay = USEC(i * self->inter_e2e_spacing_us);
-      lf_schedule_copy(emit_e2e, delay, &packet, 1);
+      lf_schedule_copy(emit_e2e, 0, &packet, 1);
 
-      printf("[t=%lld ms]   E2E#%d scheduled (+%d us): %d bytes, %d RTCM3 messages\n",
+      printf("[t=%lld ms]   E2E#%d: %d bytes, %d RTCM3 messages\n",
              lf_time_logical() / MSEC(1),
              self->e2e_counter,
-             i * self->inter_e2e_spacing_us,
              packet.bytes,
              packet.packet_info.rtcm_count);
     }
   =}
 
+  /**
+   * @brief Serialise a complete E2E packet into individual UART bytes.
+   *
+   * Iterates over every byte in the buffered E2E packet and schedules a
+   * separate @c emit_byte action for each, offset by the real UART byte
+   * time (10 bits / baudrate).  The generation timestamp is forwarded on
+   * the first byte; packet metadata is preserved on the last byte so that
+   * downstream reactors retain full observability.
+   *
+   * @param emit_e2e  Trigger carrying the fully-formed @c data_packet_t.
+   * @param emit_byte Output action; one event per byte, spaced by byte_time_us.
+   */
   reaction(emit_e2e) -> emit_byte {=
-    // Re-emit each E2E payload as one-byte packets so downstream sees one byte per event.
-    const data_packet_t* in = &emit_e2e->value;
-    for (int i = 0; i < in->bytes; i++) {
-      data_packet_t byte_packet = {0};
-      byte_packet.bytes = 1;
-      byte_packet.data[0] = in->data[i];
-      byte_packet.generation_time = in->generation_time;
-      lf_schedule_copy(emit_byte, USEC(i), &byte_packet, 1);
+    // Emit bytes one-by-one so UARTDriver consumes one byte per event.
+    // Spacing matches real UART byte time: 10 bits / baudrate.
+    // UART framing: 1 start + 8 data + 1 stop = 10 bits per byte.
+    int byte_time_us = (10 * 1000000) / self->baudrate;
+    const data_packet_t* packet = &emit_e2e->value;
+    for (int i = 0; i < packet->bytes; i++) {
+      data_packet_t one_byte = {
+        .bytes = 1
+      };
+      one_byte.data[0] = packet->data[i];
+
+      // Carry generation timestamp once per packet (on first byte).
+      if (i == 0) {
+        one_byte.generation_time = packet->generation_time;
+      }
+
+      // Preserve packet metadata on final byte to keep observability downstream.
+      if (i == packet->bytes - 1) {
+        one_byte.packet_info = packet->packet_info;
+      }
+
+      lf_schedule_copy(emit_byte, USEC(i * byte_time_us), &one_byte, 1);
     }
   =}
 
   reaction(emit_byte) -> rtcm {=
-    // Forward one-byte packet to UARTDriver.
+    // Forward exactly one byte packet to UARTDriver.
     lf_set(rtcm, emit_byte->value);
   =}
 }

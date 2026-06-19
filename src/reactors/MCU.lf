@@ -56,11 +56,19 @@ preamble {=
  *
  * Pipeline: GNSSReceiver (100ms) -> UARTDriver (interrupt) -> DataForwarder (18ms) -> Network
  */
-reactor MCU {
+reactor MCU(
+  convergence_epochs: int = 1000,  // Change in GNSSPipeline_modular, not here
+  validation_epochs:  int = 1000   // Change in GNSSPipeline_modular, not here
+) {
   output to_network: data_packet_t
-  
-  gnss = new GNSSReceiver()
-  uart = new UARTDriver()
+
+  gnss = new GNSSReceiver(
+    convergence_epochs = convergence_epochs,
+    validation_epochs  = validation_epochs,
+    sweep_epochs       = 800  // 16 probes x 50 epochs for threshold verification sweep
+  )
+  uart = new UARTDriver(convergence_epochs = convergence_epochs, validation_epochs = validation_epochs,
+                        max_interrupt_latency_us = 1000)
   forwarder = new DataForwarder()
   
   gnss.rtcm -> uart.rtcm_in

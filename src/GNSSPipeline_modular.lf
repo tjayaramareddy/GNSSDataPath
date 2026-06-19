@@ -30,8 +30,15 @@ preamble {=
  * - soc: Position calculation (PositionEngine)
  * - monitor: Latency monitoring (LatencyMonitor)
  */
-federated reactor GNSSPipeline_modular {
-  mcu = new MCU()
+federated reactor GNSSPipeline_modular(
+  // *** CONFIGURE SIMULATION LENGTH HERE ***
+  // convergence_epochs : adaptive algorithm finds safe latency ceiling (expect overflows here)
+  // validation_epochs  : runs at converged ceiling — must show 0 overflows
+  // Each epoch = 100ms of simulated GNSS time.
+  convergence_epochs: int = 1000,
+  validation_epochs:  int = 1000
+) {
+  mcu = new MCU(convergence_epochs = convergence_epochs, validation_epochs = validation_epochs)
   soc = new PositionEngine()
   monitor = new LatencyMonitor()
   

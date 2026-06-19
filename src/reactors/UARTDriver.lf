@@ -4,28 +4,6 @@
  * Models hardware UART with FIFO buffer and interrupt-driven transmission.
  * Includes realistic OS scheduling jitter affecting interrupt latency.
  *
- * Hardware Configuration:
- * - Baudrate: 460800 bps (~21.7 µs/byte with 10-bit framing)
- * - FIFO: 16 bytes total capacity
- * - Interrupt threshold: Dynamically calculated to prevent overflow
- * - Transmission time: ~17.4 ms for 800 bytes
- * - Interrupt latency: 1-200 µs (OS scheduling uncertainty)
- *
- * Interrupt Threshold Safety Margin:
- * - Worst-case latency (200 µs) allows ~9 bytes to arrive at 460800 bps
- * - FIFO is 16 bytes - sufficient margin exists (16 - 9 = 7 bytes safe)
- * - Safe threshold: FIFO_size - bytes_during_latency = 16 - 9 = 7 bytes
- * - Model uses minimal threshold (1 byte) to reduce overflow probability
- * - This represents realistic embedded system limitation where hardware
- *   interrupt latency can exceed FIFO buffering capacity
- * 
- * 
- * NOTE: This models a real-world problem in embedded systems where interrupt
- * latency guarantees are difficult to achieve, leading to potential data loss.
- * 
- * TRACING: Enable LF tracing to visualize execution timeline:
- *   target C { tracing: true }
- * View trace with: Trace Compass or Chrome (chrome://tracing)
  */
 target C
 
@@ -37,17 +15,17 @@ preamble {=
 
 reactor UARTDriver(hw_buffer_size: int = 16,             // FIFO size in bytes (typical for embedded UART)
                    baudrate: int = 460800,               // Serial transmission rate (bits per second)
-                   min_interrupt_latency_us: int = 1,    // Best-case OS response time (µs)
-                   max_interrupt_latency_us: int = 200,  // Worst-case OS scheduling jitter (µs)
-                   interrupt_log_stride: int = 50,       // Log every Nth interrupt to reduce runtime slip
-                   overflow_log_stride: int = 100        // Log detailed overflow box every Nth overflow
+                   max_interrupt_latency_us: int = 350,  // Worst-case OS scheduling jitter (µs)
+                   convergence_epochs: int = 1000,        // Phase boundary: phase2 starts at this epoch count
+                   validation_epochs: int = 1000          // Number of validation-phase epochs (for report label)
 ) {
   // ======================================================================
   // PORTS: External Interface
   // ======================================================================
   input rtcm_in: data_packet_t              // RTCM3 data from GNSS receiver
-  physical action hw_interrupt: int         // Models asynchronous hardware interrupt // ToDo: Change to Logical Action
-  physical action tx_byte: int             // Byte-by-byte UART transmit tick
+  logical action hw_interrupt: int          // Models asynchronous hardware interrupt
+  logical action phase2_start               // Fires exactly at convergence→validation boundary
+  logical action sweep_tick                 // Phase 3: self-rescheduling clock that advances the threshold sweep; fired once at startup after (convergence+validation) epochs, then re-fired every 50 epochs to mark the end of each probe and configure the next one
   output uart_out: data_packet_t            // Transmitted data to software layer
   
   // ======================================================================
@@ -55,242 +33,434 @@ reactor UARTDriver(hw_buffer_size: int = 16,             // FIFO size in bytes (
   // ======================================================================
   
   // --- Transmission State (Dynamic) ---
-  state total_bytes: int = 0                // Total bytes in current packet
-  state bytes_sent: int = 0                 // Bytes transmitted so far
-  state current_packet: data_packet_t       // Packet being transmitted
   state interrupt_threshold: int = 0        // FIFO level that triggers interrupt (calculated)
-  
+  state initial_interrupt_threshold: int = 0 // Threshold at startup (from configured max latency)
+  state last_generation_time: instant_t = 0 // Timestamp propagated to drained FIFO chunks
+  state current_max_latency_us: int = 0     // Adaptive latency limit (starts = max_interrupt_latency_us)
+  state successful_drains: int = 0          // Consecutive drain count used for latency recovery
+  state lowest_unsafe_latency_us: int = 0   // Lowest latency at which overflow was observed (convergence upper bound)
+  state highest_stable_latency_us: int = 0  // Highest latency observed without overflow (converged answer)
+  state in_validation_phase: bool = false   // Set by phase2_start action — true = validation phase
+  state phase2_overflow_events: int = 0     // Overflows during validation phase (should be 0)
+  state phase2_bytes_lost: int = 0          // Bytes lost during validation phase (should be 0)
+ 
   // --- FIFO Overflow Tracking ---
   state fifo_level: int = 0                 // Current bytes in FIFO buffer
-  state fifo_data: uint8_t[2048]           // FIFO storage for byte stream
+  state fifo_data: uint8_t[16]            // FIFO storage (matches hw_buffer_size)
   state fifo_head: int = 0                  // FIFO read index
   state fifo_tail: int = 0                  // FIFO write index
   state interrupt_pending: bool = false     // Avoid scheduling duplicate interrupts
-  state last_event_time: instant_t = 0      // Timestamp of last FIFO event (for overflow calculation)
+  state overflow_in_burst: bool = false     // True while FIFO is full in current burst (suppress cascade reductions)
   state total_bytes_lost: int = 0           // Cumulative data loss counter
   state overflow_events: int = 0            // Number of overflow occurrences
-  state interrupt_count: int = 0            // Total ISR invocations for log throttling
+
+  // --- Phase 3 Sweep ---
+  state threshold_sweep_active: bool = false  // True during Phase 3 threshold sweep
+  state sweep_probe_index: int = 0             // Index of the probe currently running (0..16)
+  state sweep_probe_overflow_count: int = 0   // Overflow events counted within the current probe
   
-  reaction(rtcm_in) -> tx_byte {=
-    // ===================================================================
-    // REACTION 1: Start UART Transmission
-    // ===================================================================
-    // Triggered when: New framed GNSS packet arrives from the receiver
-    // Purpose: Initialize byte-wise transmission and schedule the first byte tick
-    // ===================================================================
-    
-    // Store incoming packet for byte-by-byte transmission
-    self->current_packet = rtcm_in->value;
-    self->total_bytes = self->current_packet.bytes;
-    self->bytes_sent = 0;
-    
-    // Initialize FIFO tracking for overflow detection
-    self->fifo_level = 0;
-    self->fifo_head = 0;
-    self->fifo_tail = 0;
-    self->interrupt_pending = false;
-    self->last_event_time = lf_time_logical();
-    self->interrupt_count = 0;
-    
-    // printf("[t=%lld ms] UART: Starting transmission of %d bytes\n", 
-    //        lf_time_logical() / MSEC(1), self->total_bytes);
-    
-    // -------------------------------------------------------------------
-    // STEP 1: Calculate Safe Interrupt Threshold
-    // -------------------------------------------------------------------
-    // Problem: If FIFO fills up before OS services the interrupt, data is lost
-    // Solution: Trigger interrupt before FIFO can overflow during worst-case latency
-    
-    // Calculate transmission time per byte at configured baudrate
-    // UART framing: 1 start bit + 8 data bits + 1 stop bit = 10 bits per byte
-    // At 460800 bps: 1 byte = (10 bits * 1000000 µs) / 460800 bps = ~21.7 µs
+  reaction(startup) -> phase2_start, sweep_tick {=
+    // Compute interrupt threshold: trigger ISR early enough that the FIFO
+    // cannot overflow during worst-case interrupt latency.
+    //
+    // UART framing: 10 bits/byte (1 start + 8 data + 1 stop)
+    // At 460800 bps: byte_time = 10e6 / 460800 = ~21 µs
+    // Bytes arriving during max latency: ceil(200 / 21) = 10
+    // Safe threshold: FIFO_size - bytes_during_latency = 16 - 10 = 6
     interval_t byte_time_us = (10 * 1000000) / self->baudrate;
-    
-    // Estimate how many bytes could arrive during worst-case interrupt latency (200 µs).
-    // The "+ 1" acts like a ceiling approximation so we stay conservative when
-    // converting the latency window into whole bytes.
-    // At 460800 bps: 200 µs / 21.7 µs = ~9 bytes, so this rounds up to 10.
     int bytes_during_max_latency = (self->max_interrupt_latency_us / byte_time_us) + 1;
-    
-    // Theoretical safe threshold to prevent overflow:
-    // threshold + bytes_during_latency <= FIFO_size
-    // threshold <= FIFO_size - bytes_during_latency = 16 - 10 = 6 bytes (SAFE!)
-    int margin_based_threshold = self->hw_buffer_size - bytes_during_max_latency;
-   
-    // Margin is positive - use calculated safe threshold
-    self->interrupt_threshold = margin_based_threshold;
-    
-    // Sanity check: Ensure threshold is at least 1 byte
+
+    self->interrupt_threshold = self->hw_buffer_size - bytes_during_max_latency;
     if (self->interrupt_threshold < 1) {
       self->interrupt_threshold = 1;
     }
-    
-    // WARNING: Detect impossible scenarios
-    // if (margin_based_threshold < 0) {
-    //   printf("[WARNING] UART OVERFLOW RISK: %d bytes can arrive during max latency (%d µs),\n",
-    //          bytes_during_max_latency, self->max_interrupt_latency_us);
-    //   printf("           but FIFO capacity is only %d bytes!\n", self->hw_buffer_size);
-    //   printf("           Using minimal threshold (%d byte) - data loss possible in worst case.\n",
-    //          self->interrupt_threshold);
-    //   printf("           Solutions: (1) Reduce max_interrupt_latency, (2) Increase FIFO size - HW solution,\n");
-    //   printf("           (3) Reduce baudrate, or (4) Accept potential data loss.\n");
-    // }
-    
-    // Log transmission parameters
-    printf("[t=%lld ms] UART transmission start: %d bytes\n",
-           lf_time_logical() / MSEC(1), self->total_bytes);
-    printf("[t=%lld ms] UART: Interrupt threshold=%d bytes (FIFO=%d bytes, ",
-           lf_time_logical() / MSEC(1), self->interrupt_threshold, self->hw_buffer_size);
-    printf("%d bytes can arrive during max latency=%d µs)\n",
+    self->initial_interrupt_threshold = self->interrupt_threshold;  // save for report
+
+    // Allocate the FIFO byte buffer manually 
+    self->fifo_data = (uint8_t*)calloc(self->hw_buffer_size, sizeof(uint8_t));
+    self->current_max_latency_us = self->max_interrupt_latency_us;
+
+    printf("[t=%lld ms] UART ready: threshold=%d bytes (FIFO=%d, %d bytes arrive during max latency=%d µs)\n",
+           lf_time_logical() / MSEC(1), self->interrupt_threshold, self->hw_buffer_size,
            bytes_during_max_latency, self->max_interrupt_latency_us);
-    
-    // -------------------------------------------------------------------
-    // STEP 2: Schedule First Hardware Interrupt
-    // -------------------------------------------------------------------
-    // Hardware model: FIFO fills at baudrate, OS responds with random latency
-    
-    // Time for FIFO to fill to the current 6-byte interrupt threshold
-    // 6 bytes * 21 µs/byte = 126 µs fill time with the current defaults
-    interval_t buffer_fill_time = USEC(byte_time_us * self->interrupt_threshold);
-    
-    // Simulate OS scheduling jitter: Random latency between 1-200 µs
-    // Models context switches, interrupt priority, and scheduler delays
-    int latency_us = self->min_interrupt_latency_us + 
-                     (rand() % (self->max_interrupt_latency_us - self->min_interrupt_latency_us + 1));
-    
-    // Total delay = hardware fill time + OS scheduling latency
-    interval_t total_delay = buffer_fill_time + USEC(latency_us);
-    
-    printf("[t=%lld ms] UART interrupt scheduled: fill_time=%lld µs + latency=%d µs = %lld µs\n",
-           lf_time_logical() / MSEC(1), buffer_fill_time / 1000, latency_us, total_delay / 1000);
-    
-    // Schedule the first byte on the UART line.
-    lf_schedule_int(tx_byte, USEC(byte_time_us), 0);
+    // Schedule exact phase boundary — fires at convergence_epochs * 100ms logical time.
+    if (self->convergence_epochs > 0) {
+      lf_schedule(phase2_start, (interval_t)self->convergence_epochs * MSEC(100));
+    }
+    // Schedule Phase 3 sweep start — fires after both convergence + validation epochs.
+    lf_schedule(sweep_tick,
+      (interval_t)(self->convergence_epochs + self->validation_epochs) * MSEC(100));
   =}
 
-  reaction(tx_byte) -> hw_interrupt, tx_byte {=
-    // ===================================================================
-    // REACTION 2: Transmit One Byte into FIFO
-    // ===================================================================
-    // Triggered when: UART shift-register produces the next byte on the wire
-    // Purpose: Write the byte to FIFO and schedule interrupts when needed
-    // ===================================================================
+  // Flip the phase flag at the exact convergence→validation boundary.
+  reaction(phase2_start) {=
+    self->in_validation_phase = true;
+    printf("[t=%lld ms] [UART] Phase 2 tracking active.\n", lf_time_logical() / MSEC(1));  =}
 
-    if (tx_byte->value >= self->total_bytes) {
-      return;
+  // -----------------------------------------------------------------------
+  // Phase 3: Threshold Sweep
+  //
+  // 17 probes (50 epochs each = 850 total):
+  //   Probes  0–14 : T = 15..1 at top of each threshold's configured latency range  [SAFE]
+  //   Probe  15    : T = 1 at the safe ceiling (335 µs = 16*byte_time - 1)          [SAFE]
+  //   Probe  16    : T = 1 one step above safe ceiling (336 µs = 16*byte_time)       [OVERFLOW expected]
+  //
+  // On each sweep_tick: print result of completed probe, configure next probe.
+  // AIMD (overflow reduction + recovery) is FROZEN during the sweep.
+  // -----------------------------------------------------------------------
+  reaction(sweep_tick) -> sweep_tick {=
+    int byte_time = (10 * 1000000) / self->baudrate;
+    const int N_PROBES     = 17;
+    const int PROBE_EPOCHS = 50;
+
+    // First call: announce Phase 3.
+    if (!self->threshold_sweep_active) {
+      self->in_validation_phase = false;
+      self->threshold_sweep_active = true;
+      printf("\n\033[1;35m");
+      printf("============= PHASE 3: THRESHOLD EXPERIMENTAL VERIFICATION =============\n");
+      printf("  %d probes x %d epochs | FIFO=%d | baudrate=%d | byte_time=%d µs\n",
+             N_PROBES, PROBE_EPOCHS, self->hw_buffer_size, self->baudrate, byte_time);
+      printf("  AIMD frozen — each probe runs at fixed configured max latency.\n\n");
+      printf("  %-4s  %-10s  %-8s  %-13s  %-12s  %s\n",
+             "T", "max(µs)", "thresh", "safe_ceil(µs)", "overflows", "result");
+      printf("  %-4s  %-10s  %-8s  %-13s  %-12s  %s\n",
+             "----", "----------", "--------", "-------------", "------------", "------");
+      printf("\033[0m");
     }
 
-    instant_t current_time = lf_time_logical();
-    interval_t byte_time_us = (10 * 1000000) / self->baudrate;
-    int byte_index = tx_byte->value;
-    uint8_t current_byte = self->current_packet.data[byte_index];
-
-    self->interrupt_count++;
-
-    // One byte arrives per tick, so FIFO growth is deterministic.
-    int new_fifo_level = self->fifo_level + 1;
-    if (new_fifo_level > self->hw_buffer_size) {
-      int bytes_lost = new_fifo_level - self->hw_buffer_size;
-      self->total_bytes_lost += bytes_lost;
-      self->overflow_events++;
-
-      int lost_byte_start = byte_index;
-      int lost_byte_end = byte_index;
-
-      if (self->overflow_events <= 3 ||
-          (self->overflow_log_stride > 0 &&
-           (self->overflow_events % self->overflow_log_stride == 0))) {
-        print_fifo_overflow(current_time / MSEC(1), self->hw_buffer_size, self->fifo_level,
-                            1, 0, bytes_lost, lost_byte_start, lost_byte_end,
-                            self->total_bytes_lost, self->overflow_events);
+    // Print the result of the probe that just finished.
+    //
+    // sweep_probe_index has already been incremented, so the completed probe
+    // is at index (sweep_probe_index - 1).  Its T and max_latency are not
+    // stored — they are re-derived from the index using the same mapping
+    // that was used when the probe was configured:
+    //
+    //   Probes 0–14 : T counts down from 15 to 1 as the index increases.
+    //                 max_latency = (index+1) * byte_time - 1
+    //                 Example: index=2 → T=13, max_latency = 3×21−1 = 62 µs
+    //
+    //   Probe 15    : T=1, max_latency = 16×byte_time−1 = 335 µs
+    //                 This is the exact safe ceiling — the highest latency
+    //                 T=1 can tolerate without any byte being dropped.
+    //
+    //   Probe 16    : T=1, max_latency = 16×byte_time = 336 µs
+    //                 One µs above the safe ceiling — the FIFO must overflow
+    //                 here to confirm the formula is tight.
+    if (self->sweep_probe_index > 0) {
+      int prev = self->sweep_probe_index - 1;
+      int t_prev, max_prev;
+      if (prev <= 14) {
+        t_prev   = 15 - prev;                  // T: 15 at probe 0, down to 1 at probe 14
+        max_prev = (prev + 1) * byte_time - 1; // e.g. prev=2: 3×21−1 = 62 µs
+      } else if (prev == 15) {
+        t_prev   = 1;
+        max_prev = 16 * byte_time - 1;         // 335 µs — exact safe ceiling for T=1
+      } else {                                 // prev == 16
+        t_prev   = 1;
+        max_prev = 16 * byte_time;             // 336 µs — one µs above safe ceiling, must overflow
       }
+      int bytes_d   = max_prev / byte_time + 1;
+      int thr_prev  = self->hw_buffer_size - bytes_d;
+      if (thr_prev < 1) thr_prev = 1;
+      int safe_ceil = (self->hw_buffer_size + 1 - thr_prev) * byte_time - 1;
 
-      new_fifo_level = self->hw_buffer_size;
-    } else {
-      self->fifo_data[self->fifo_tail] = current_byte;
-      self->fifo_tail = (self->fifo_tail + 1) % self->hw_buffer_size;
+      int expect_zero = (prev < N_PROBES - 1);  // last probe expects overflow
+      const char* result_str;
+      if (expect_zero && self->sweep_probe_overflow_count == 0) {
+        result_str = "\033[1;32mPASS \u2713 (0 overflows)\033[0m";
+      } else if (!expect_zero && self->sweep_probe_overflow_count > 0) {
+        result_str = "\033[1;31mOVERFLOW \u2713 confirmed\033[0m";
+      } else if (expect_zero && self->sweep_probe_overflow_count > 0) {
+        result_str = "\033[1;31mFAIL \u2717 unexpected overflow\033[0m";
+      } else {
+        result_str = "\033[1;33mWARN \u2014 expected overflow but got 0\033[0m";
+      }
+      printf("\033[1;35m  %-4d  %-10d  %-8d  %-13d  %-12d  %s\033[0m\n",
+             t_prev, max_prev, thr_prev, safe_ceil,
+             self->sweep_probe_overflow_count, result_str);
+
+      // Reset counters for next probe.
+      self->sweep_probe_overflow_count = 0;
     }
 
-    self->fifo_level = new_fifo_level;
-    self->bytes_sent = byte_index + 1;
-    self->last_event_time = current_time;
+    if (self->sweep_probe_index < N_PROBES) {
+      int i = self->sweep_probe_index;
+      int max_lat;
+      if (i <= 14) {
+        max_lat = (i + 1) * byte_time - 1;
+      } else if (i == 15) {
+        max_lat = 16 * byte_time - 1;  // 335 — safe ceiling
+      } else {
+        max_lat = 16 * byte_time;      // 336 — unsafe
+      }
+      // Force probe settings (AIMD bypassed during sweep).
+      self->current_max_latency_us  = max_lat;
+      int bytes_d = max_lat / byte_time + 1;
+      int thresh  = self->hw_buffer_size - bytes_d;
+      if (thresh < 1) thresh = 1;
+      self->interrupt_threshold     = thresh;
+      self->overflow_in_burst       = false;
+      self->successful_drains       = 0;
 
-    if (!self->interrupt_pending &&
-        (self->fifo_level >= self->interrupt_threshold || self->bytes_sent == self->total_bytes)) {
-      int latency_us = self->min_interrupt_latency_us +
-                       (rand() % (self->max_interrupt_latency_us - self->min_interrupt_latency_us + 1));
+      self->sweep_probe_index++;
+      lf_schedule(sweep_tick, (interval_t)PROBE_EPOCHS * MSEC(100));
+    } else {
+      // All probes done.
+      printf("\033[1;35m=========================================================================\033[0m\n");
+      printf("\033[1;35m  Formula verified: safe_ceil = (FIFO+1-T) * byte_time - 1\033[0m\n");
+      printf("\033[1;35m  Probe 16 (max=336µs) > safe_ceil=335µs \u2192 OVERFLOW confirms boundary.\033[0m\n\n");
+    }
+  =}
+
+  /**
+   * @brief Receive one incoming UART byte, write it into the FIFO, and fire the
+   *        hardware interrupt when the FIFO is ready to be drained.
+   *
+   * Called once per byte emitted by GNSSReceiver.  The reaction does three things:
+   *
+   *  1. OVERFLOW CHECK — if the FIFO is already full, the byte is dropped,
+   *     overflow counters are updated, and (outside Phase 3) the AIMD algorithm
+   *     immediately reduces current_max_latency_us by 20 % and recalculates the
+   *     interrupt threshold so future bursts trigger the ISR earlier.
+   *
+   *  2. FIFO WRITE — the byte is appended to the ring buffer and fifo_level is
+   *     incremented.
+   *
+   *  3. INTERRUPT SCHEDULING — if no interrupt is already pending and either the
+   *     FIFO has reached interrupt_threshold OR this is the last byte of a packet,
+   *     a hw_interrupt action is scheduled after a random latency in the range
+   *     [0, current_max_latency_us] µs, modelling OS scheduling jitter.
+   *     The last byte of a packet always triggers an immediate flush (latency = 0)
+   *     to model the UART receive-timeout behaviour of real hardware.
+   */
+  reaction(rtcm_in) -> hw_interrupt {=
+    if (rtcm_in->value.generation_time > 0)
+      self->last_generation_time = rtcm_in->value.generation_time;
+
+    // No space in FIFO — drop byte and report loss.
+    if (self->fifo_level >= self->hw_buffer_size) {
+      self->total_bytes_lost++;
+      self->overflow_events++;
+      // Track phase 2 overflows separately (should be 0 if convergence worked).
+      if (self->in_validation_phase) {
+        self->phase2_overflow_events++;
+        self->phase2_bytes_lost++;
+      }
+      fprintf(stderr, "\033[1;31m\n!!!!!!!!!!!!!!!!!!!!! FIFO OVERFLOW !!!!!!!!!!!!!!!!!!!!!!\033[0m\n");
+      fprintf(stderr, "\033[1;31m  t=%lld ms | byte dropped | total_lost=%d | event=#%d\033[0m\n",
+              lf_time_logical() / MSEC(1), self->total_bytes_lost, self->overflow_events);
+      fprintf(stderr, "\033[1;31m!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\033[0m\n\n");
+      // ADAPTIVE: Reduce effective latency limit by 20% — only on the FIRST overflow
+      // of each burst (while FIFO is full). Skipped entirely during Phase 3 sweep.
+      if (self->threshold_sweep_active) {
+        self->sweep_probe_overflow_count++;
+      } else if (!self->overflow_in_burst) {
+        self->overflow_in_burst = true;
+        int new_latency = (self->current_max_latency_us * 8) / 10;
+        if (new_latency < 10) new_latency = 10;
+        if (new_latency != self->current_max_latency_us) {
+          int old_latency = self->current_max_latency_us;
+          self->current_max_latency_us = new_latency;
+          interval_t byte_time_us = (10 * 1000000) / self->baudrate;
+          int bytes_during = (new_latency / byte_time_us) + 1;
+          int new_thresh = self->hw_buffer_size - bytes_during;
+          if (new_thresh < 1) new_thresh = 1;
+          self->interrupt_threshold = new_thresh;
+          self->successful_drains = 0;
+          // Track lowest latency that caused overflow — caps future recovery.
+          if (self->lowest_unsafe_latency_us == 0 ||
+              old_latency < self->lowest_unsafe_latency_us)
+            self->lowest_unsafe_latency_us = old_latency;
+          printf("\033[1;36m[ADAPTIVE] t=%lld ms | latency %d \u2192 %d \u00b5s (cfg=%d) | threshold %d | overflow #%d | unsafe_floor=%d\033[0m\n",
+                 lf_time_logical() / MSEC(1), old_latency, new_latency,
+                 self->max_interrupt_latency_us, new_thresh, self->overflow_events,
+                 self->lowest_unsafe_latency_us);
+        }
+      }
+      return;  // byte was dropped — do not write to FIFO
+    }
+
+    // Write byte into FIFO.
+    self->fifo_data[self->fifo_tail] = rtcm_in->value.data[0];
+    self->fifo_tail = (self->fifo_tail + 1) % self->hw_buffer_size;
+    self->fifo_level++;
+
+    // Detect end-of-packet: GNSSReceiver sets rtcm_count > 0 only on the last byte.
+    // Force an immediate FIFO flush so the ring buffer always gets a complete packet.
+    // This models a UART receive-timeout flush (real HW flushes after ~3.5 char idle time).
+    bool is_last_byte = rtcm_in->value.packet_info.rtcm_count > 0;
+
+    // Trigger hardware interrupt when FIFO reaches threshold OR packet is complete.
+    if (!self->interrupt_pending && (self->fifo_level >= self->interrupt_threshold || is_last_byte)) {
+      int latency_us = is_last_byte ? 0 : rand() % (self->current_max_latency_us + 1);
       self->interrupt_pending = true;
       lf_schedule_int(hw_interrupt, USEC(latency_us), self->fifo_level);
     }
-
-    if (self->bytes_sent < self->total_bytes) {
-      lf_schedule_int(tx_byte, USEC(byte_time_us), self->bytes_sent);
-    }
   =}
 
-  reaction(hw_interrupt) -> uart_out, hw_interrupt {=
-    // ===================================================================
-    // REACTION 2: Handle Hardware Interrupt (ISR Simulation)
-    // ===================================================================
-    // Triggered when: Hardware interrupt fires (physical action scheduled)
-    // Purpose: Drain FIFO and forward data to next stage
-    // Models: Interrupt Service Routine (ISR) execution
-    // ===================================================================
+  /**
+   * @brief ISR handler — drain the entire FIFO into one output packet and
+   *        apply the AIMD latency recovery step if conditions are met.
+   *
+   * This reaction models the CPU servicing a UART receive interrupt.  It runs
+   * after the jitter delay that was injected by reaction(rtcm_in), so the gap
+   * between the interrupt being raised and this reaction executing represents
+   * real OS scheduling latency.
+   *
+   * What it does:
+   *  1. DRAIN — reads every byte currently in the FIFO ring buffer into a single
+   *     data_packet_t and sends it downstream via uart_out.  Clears fifo_level
+   *     to 0 so the ring buffer is ready for the next burst.
+   *
+   *  2. AIMD RECOVERY — after every 20 consecutive successful drains (no overflow
+   *     in between), increases current_max_latency_us by 5 % up to the cap
+   *     (lowest_unsafe_latency_us - 1).  This gradually relaxes the latency
+   *     budget back towards the configured maximum once the system is stable.
+   *     Recovery is skipped entirely during Phase 3 (threshold sweep).
+   *
+   *  3. BURST-END RESET — clears overflow_in_burst so the next overflow in a
+   *     fresh burst can trigger another AIMD reduction.
+   */
+  reaction(hw_interrupt) -> uart_out {=
     self->interrupt_pending = false;
-    
-    // -------------------------------------------------------------------
-    // STEP 1: Check for FIFO Overflow (Data Loss Detection)
-    // -------------------------------------------------------------------
-    instant_t current_time = lf_time_logical();
-    self->interrupt_count++;
-    
-    // -------------------------------------------------------------------
-    // STEP 2: Drain FIFO
-    // -------------------------------------------------------------------
-    // Drain everything currently in FIFO.
-    int bytes_this_interrupt = self->fifo_level;
-    
-    // Update transmission progress counter and FIFO level
+    self->overflow_in_burst = false;   // Burst is over — allow next overflow to trigger reduction
+
+    int bytes_to_drain = self->fifo_level;
     self->fifo_level = 0;
-    self->last_event_time = current_time;
 
-    if (bytes_this_interrupt > 0) {
+    if (bytes_to_drain > 0) {
       data_packet_t out_packet = {0};
-      out_packet.bytes = bytes_this_interrupt;
-      out_packet.generation_time = self->current_packet.generation_time;
+      out_packet.bytes = bytes_to_drain;
+      out_packet.generation_time = self->last_generation_time;
 
-      for (int i = 0; i < bytes_this_interrupt; i++) {
+      for (int i = 0; i < bytes_to_drain; i++) {
         out_packet.data[i] = self->fifo_data[self->fifo_head];
         self->fifo_head = (self->fifo_head + 1) % self->hw_buffer_size;
       }
 
-      // Don't copy full packet_info for intermediate chunks (only for final transmission).
-      out_packet.packet_info.rtcm_count = 0;
       lf_set(uart_out, out_packet);
-    }
-    
-    if (self->bytes_sent >= self->total_bytes && self->fifo_level == 0) {
-      // Transmission complete - send final packet with corruption info to DataForwarder.
-      printf("[t=%lld ms] UART: Transmission complete - %d bytes sent",
-             current_time / MSEC(1), self->bytes_sent);
-      
-      if (self->total_bytes_lost > 0) {
-        printf(", %d bytes lost (%.2f%% loss rate)\n",
-               self->total_bytes_lost,
-               (100.0 * self->total_bytes_lost) / (self->bytes_sent + self->total_bytes_lost));
-      } else {
-        printf(" - No data loss\n");
+
+      // ADAPTIVE: Recover latency +5% every 20 successful drains. Frozen during Phase 3.
+      self->successful_drains++;
+      // Track highest latency at which a drain succeeded AFTER convergence began.
+      // Only start tracking after the first overflow so we don't record the initial
+      // (potentially unsafe) configured latency as "stable".
+      if (self->lowest_unsafe_latency_us > 0 &&
+          self->current_max_latency_us > self->highest_stable_latency_us)
+        self->highest_stable_latency_us = self->current_max_latency_us;
+
+      if (!self->threshold_sweep_active &&
+          self->successful_drains >= 20 &&
+          self->current_max_latency_us < self->max_interrupt_latency_us) {
+        // Cap at (lowest_unsafe - 1): never re-enter the known overflow zone.
+        int recovery_cap = (self->lowest_unsafe_latency_us > 0)
+                           ? self->lowest_unsafe_latency_us - 1
+                           : self->max_interrupt_latency_us;
+        int new_latency = (self->current_max_latency_us * 105) / 100;
+        if (new_latency > recovery_cap) new_latency = recovery_cap;
+        int old_latency = self->current_max_latency_us;
+        if (new_latency == old_latency) {
+          // Converged: already at the safe ceiling — nothing to do.
+          self->successful_drains = 0;
+        } else {
+          self->current_max_latency_us = new_latency;
+          interval_t byte_time_us = (10 * 1000000) / self->baudrate;
+          int bytes_during = (new_latency / byte_time_us) + 1;
+          int new_thresh = self->hw_buffer_size - bytes_during;
+          if (new_thresh < 1) new_thresh = 1;
+          self->interrupt_threshold = new_thresh;
+          self->successful_drains = 0;
+          printf("\033[1;32m[ADAPTIVE] t=%lld ms | latency %d → %d µs (cap=%d) | threshold %d | stable_peak=%d\033[0m\n",
+                 lf_time_logical() / MSEC(1), old_latency, new_latency,
+                 recovery_cap, new_thresh, self->highest_stable_latency_us);
+        }
       }
-      
-      // Forward completion metadata only to avoid duplicating already streamed bytes.
-      data_packet_t out_packet = self->current_packet;
-      out_packet.bytes = 0;
-      lf_set(uart_out, out_packet);
-    } else if (self->fifo_level >= self->interrupt_threshold && !self->interrupt_pending) {
-      int latency_us = self->min_interrupt_latency_us +
-                       (rand() % (self->max_interrupt_latency_us - self->min_interrupt_latency_us + 1));
-      self->interrupt_pending = true;
-      lf_schedule_int(hw_interrupt, USEC(latency_us), self->fifo_level);
+    }
+  =}
+
+  /**
+   * @brief Print a full end-of-run report summarising the AIMD adaptive control
+   *        results across all three simulation phases.
+   *
+   * Runs once when the simulation ends (after all epochs complete or lf_request_stop
+   * is called).  No state is modified — this reaction is purely diagnostic output.
+   *
+   * The report contains three sections:
+   *
+   *  1. CONVERGENCE SUMMARY — the configured vs. converged latency values:
+   *       - initial and final interrupt threshold
+   *       - lowest latency that caused an overflow (AIMD upper bound)
+   *       - converged safe ceiling (lowest_unsafe - 1)
+   *       - highest latency observed during stable drains
+   *
+   *  2. PHASE RESULTS — overflow events and bytes lost broken down per phase:
+   *       - Phase 1 (convergence): overflows are expected while AIMD learns
+   *       - Phase 2 (validation):  zero overflows expected if convergence worked
+   *
+   *  3. THRESHOLD REFERENCE TABLE — for every possible threshold value T (1..FIFO-1),
+   *     prints the maximum safe ISR latency according to the formula:
+   *       max_safe = (FIFO + 1 - T) * byte_time - 1
+   */
+  reaction(shutdown) {=
+    int safe_ceiling = (self->lowest_unsafe_latency_us > 0)
+                       ? self->lowest_unsafe_latency_us - 1
+                       : self->max_interrupt_latency_us;
+    int phase1_overflows  = self->overflow_events  - self->phase2_overflow_events;
+    int phase1_bytes_lost = self->total_bytes_lost - self->phase2_bytes_lost;
+
+    printf("\n\033[1;33m========== UART ADAPTIVE CONTROL REPORT ==========\033[0m\n");
+    printf("\033[1;33m  Configured max latency  : %d µs\033[0m\n", self->max_interrupt_latency_us);    {
+      int bytes_in_window = (self->max_interrupt_latency_us / ((10 * 1000000) / self->baudrate)) + 1;
+      const char* clamp_note = (bytes_in_window > self->hw_buffer_size)
+                               ? " > FIFO \u2192 clamped to min" : "";
+      printf("\033[1;33m  Initial threshold       : %d bytes  (FIFO-%d at %d\u00b5s: %d bytes arrive%s)\033[0m\n",
+             self->initial_interrupt_threshold, self->hw_buffer_size,
+             self->max_interrupt_latency_us, bytes_in_window, clamp_note);
+    }
+    printf("\033[1;33m  Final threshold         : %d bytes  (after convergence to %d \u00b5s)\033[0m\n",
+           self->interrupt_threshold, self->current_max_latency_us);    printf("\033[1;33m  Lowest unsafe latency   : %d µs  (first overflow point)\033[0m\n",
+           self->lowest_unsafe_latency_us > 0 ? self->lowest_unsafe_latency_us : -1);
+    printf("\033[1;33m  Converged safe ceiling  : %d µs  (max safe latency)\033[0m\n", safe_ceiling);
+    printf("\033[1;33m  Final latency setting   : %d µs\033[0m\n", self->current_max_latency_us);
+    printf("\033[1;33m  Highest stable observed : %d µs\033[0m\n", self->highest_stable_latency_us);
+    printf("\033[1;33m------- Phase 1: Convergence (%d epochs) --------\033[0m\n",
+           self->convergence_epochs);
+    printf("\033[1;33m  Overflow events         : %d\033[0m\n", phase1_overflows);
+    printf("\033[1;33m  Bytes lost              : %d\033[0m\n", phase1_bytes_lost);
+    printf("\033[1;33m------- Phase 2: Validation (%d epochs) ---------\033[0m\n",
+           self->validation_epochs);
+    if (self->phase2_overflow_events == 0) {
+      printf("\033[1;32m  Overflow events         : 0  \u2713 ZERO OVERFLOWS \u2014 ceiling is correct!\033[0m\n");
+      printf("\033[1;32m  Bytes lost              : 0\033[0m\n");
+    } else {
+      printf("\033[1;31m  Overflow events         : %d  \u2717 UNEXPECTED \u2014 ceiling may be too high\033[0m\n",
+             self->phase2_overflow_events);
+      printf("\033[1;31m  Bytes lost              : %d\033[0m\n", self->phase2_bytes_lost);
+    }
+    printf("\033[1;33m==================================================\033[0m\n\n");
+
+    // ---- Threshold vs Max-Safe-Latency Reference Table (Theoritrical. Not measured with simulation)----
+    {
+      int byte_time = (10 * 1000000) / self->baudrate;
+      printf("\033[1;35m--- Threshold vs. Max Safe Latency  (FIFO=%d, byte_time=%d µs @ %d baud) ---\033[0m\n",
+             self->hw_buffer_size, byte_time, self->baudrate);
+      printf("\033[1;35m  %-12s %-22s\033[0m\n",
+             "Threshold", "Max safe latency (µs)");
+      printf("\033[1;35m  %-12s %-22s\033[0m\n",
+             "----------", "---------------------");
+      for (int t = 1; t <= self->hw_buffer_size; t++) {
+        int max_safe = (self->hw_buffer_size - t + 1) * byte_time - 1;
+        const char* marker = (t == self->interrupt_threshold) ? "  <-- current" : "";
+        if (t < self->hw_buffer_size) {
+          printf("\033[1;35m  %-12d %-12d%s\033[0m\n", t, max_safe, marker);
+        } else {
+          // t == FIFO: not achievable via formula (bytes_during would be 0)
+          printf("\033[1;35m  %-12d %-12s\033[0m\n", t, "N/A");
+        }
+      }
+      printf("\033[1;35m  Formula: max_safe = (FIFO + 1 - threshold) * byte_time - 1\033[0m\n");
+      printf("\033[1;35m--------------------------------------------------\033[0m\n\n");
     }
   =}
 }

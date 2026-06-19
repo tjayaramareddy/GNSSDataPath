@@ -8,6 +8,8 @@ target C
 
 preamble {=
   #include "gnss_common.h"
+  #include <string.h>
+  #include <stdlib.h>
 =}
 
 /**
@@ -22,7 +24,7 @@ reactor DataForwarder {
   output network_out: data_packet_t
   
   // Ring buffer state
-  state memory_buffer: uint8_t[1000]  // Conservative size - monitoring for overflow
+  state memory_buffer: uint8_t[1024]  // Must match MEM_BUFFER_SIZE in gnss_common.h
   state write_ptr: int = 0
   state read_ptr: int = 0
   state max_buffer_usage: int = 0
@@ -33,6 +35,7 @@ reactor DataForwarder {
   state total_messages_received: int = 0
   state total_messages_corrupted: int = 0
   state last_packet_info: e2e_packet_info_t
+  state last_e2e_counter: int = -1   // -1 = no packet seen yet; valid range 0-65535
   
   // Buffer overflow tracking
   state buffer_overflow_events: int = 0
@@ -57,6 +60,8 @@ reactor DataForwarder {
   =}
   
   reaction(startup) {=
+    // LF C target generates array states as uint8_t* with no automatic allocation.
+    self->memory_buffer = (uint8_t*)calloc(MEM_BUFFER_SIZE, sizeof(uint8_t));
     printf("[INIT] DataForwarder: period=18ms, deadline=20ms, watchdog=100ms\n");
   =}
   
@@ -67,9 +72,6 @@ reactor DataForwarder {
     
     // Check if this is a complete packet with message metadata (from transmission end)
     if (mem_in->value.packet_info.rtcm_count > 0) {
-      int complete_count = 0;
-      int corrupted_count = 0;
-      
       // Store packet info for shutdown report
       self->last_packet_info = mem_in->value.packet_info;
     }
@@ -86,7 +88,10 @@ reactor DataForwarder {
                     (self->read_ptr - self->write_ptr);
     
     if (bytes_to_write <= available) {
-      // Update write pointer (simplified model - actual data copy abstracted)
+      // Copy bytes into ring buffer.
+      for (int i = 0; i < bytes_to_write; i++) {
+        self->memory_buffer[(self->write_ptr + i) % buffer_size] = mem_in->value.data[i];
+      }
       self->write_ptr = (self->write_ptr + bytes_to_write) % buffer_size;
       
       // Calculate current buffer occupancy
@@ -112,7 +117,9 @@ reactor DataForwarder {
     }
   =}
   
-  reaction(period) -> network_out {=
+  reaction(period) -> network_out, forwarding_watchdog {=
+    lf_watchdog_start(forwarding_watchdog, 0);  // Pet watchdog: prove period reaction is alive
+
     // LF TIME TRACKING: Measure execution lag
     instant_t logical_now = lf_time_logical();
     instant_t physical_now = lf_time_physical();
@@ -136,32 +143,68 @@ reactor DataForwarder {
     }
     
     if (available_data > 0 && self->has_data) {
-      // Forward all available data
-      self->total_forwards++;
-      self->total_bytes_forwarded += available_data;
-      
-      // Preserve earliest generation timestamp for end-to-end latency measurement
-      data_packet_t out_packet = {
-        .bytes = available_data, 
-        .generation_time = self->earliest_gen_time
-      };
-      
-      // Parse packet before sending on network output
-      int rtcm_count = parse_e2e_packet(&out_packet);
-      printf("[t=%lld ms] Parsed outgoing packet: %d RTCM3 messages\n",
-             lf_time_logical() / MSEC(1), rtcm_count);
-      
-      lf_set(network_out, out_packet);
-      
-      printf("[t=%lld ms] Forward: %d bytes to network (total: %d forwards, %d bytes)\n",
-             lf_time_logical() / MSEC(1), available_data, 
-             self->total_forwards, self->total_bytes_forwarded);
-      
-      // Drain ring buffer
-      self->read_ptr = (self->read_ptr + available_data) % buffer_size;
-      if (self->read_ptr == self->write_ptr) {
-        self->has_data = false;
+      // Snapshot available bytes — do NOT drain ring buffer yet.
+      // read_ptr advances only by bytes belonging to complete packets.
+      // Incomplete trailing bytes remain in the ring buffer and accumulate
+      // across periods until the full E2E packet has arrived.
+      uint8_t staging[MEM_BUFFER_SIZE];
+      for (int i = 0; i < available_data; i++)
+        staging[i] = self->memory_buffer[(self->read_ptr + i) % buffer_size];
+
+      int consumed = 0;
+      while (consumed + E2E_HEADER_SIZE <= available_data) {
+        if (!validate_e2e_preamble(&staging[consumed])) {
+          consumed++; // Skip non-preamble byte (tail of previous partial packet).
+          continue;
+        }
+
+        uint16_t e2e_length = ((uint16_t)staging[consumed + 4] << 8) | staging[consumed + 5];
+
+        // Incomplete packet — wait for more bytes in the next period.
+        // Reject oversized declared length (malformed packet guard).
+        if (e2e_length < E2E_HEADER_SIZE || e2e_length > MEM_BUFFER_SIZE || consumed + (int)e2e_length > available_data)
+          break;
+
+        // Complete packet — validate CRC and forward.
+        data_packet_t out_packet = {0};
+        out_packet.bytes = e2e_length;
+        out_packet.generation_time = self->earliest_gen_time;
+        memcpy(out_packet.data, &staging[consumed], e2e_length);
+
+        parse_e2e_packet(&out_packet);
+        if (!validate_e2e_crc(&out_packet)) {
+          self->total_messages_corrupted++;
+          printf("[t=%lld ms] CRC FAIL: corrupted packet (%d bytes), dropping (total=%d)\n",
+                 lf_time_logical() / MSEC(1), e2e_length, self->total_messages_corrupted);
+        } else {
+          // Validate E2E counter sequence (16-bit, wraps 65535 -> 0).
+          uint16_t rx_counter = out_packet.packet_info.e2e_counter;
+          if (self->last_e2e_counter >= 0) {
+            uint16_t expected = (uint16_t)((self->last_e2e_counter + 1) & 0xFFFF);
+            if (rx_counter != expected) {
+              printf("[t=%lld ms] E2E COUNTER ERROR: expected %u, got %u\n",
+                     lf_time_logical() / MSEC(1), expected, rx_counter);
+            }
+          }
+          self->last_e2e_counter = rx_counter;
+
+          self->total_forwards++;
+          self->total_bytes_forwarded += e2e_length;
+          lf_set(network_out, out_packet);
+          printf("[t=%lld ms] Forward: %d bytes, %d RTCM3 msgs, E2E counter=%u (total: %d forwards, %d bytes)\n",
+                 lf_time_logical() / MSEC(1), e2e_length,
+                 out_packet.packet_info.rtcm_count, rx_counter,
+                 self->total_forwards, self->total_bytes_forwarded);
+        }
+        consumed += e2e_length;
       }
+
+      // Advance read_ptr only past fully consumed (complete) packets.
+      self->read_ptr = (self->read_ptr + consumed) % buffer_size;
+      self->has_data = (self->read_ptr != self->write_ptr);
+      // Reset gen_time when buffer is fully drained so the next packet sets its own timestamp.
+      if (!self->has_data)
+        self->earliest_gen_time = 0;
     } else {
       printf("[t=%lld ms] Forward: idle (no data)\n", lf_time_logical() / MSEC(1));
     }
@@ -175,6 +218,14 @@ reactor DataForwarder {
   =}
   
   reaction(shutdown) {=
-    
+    printf("\n=== DataForwarder Shutdown Report ===\n");
+    printf("  Forwarded:        %d packets, %d bytes\n", self->total_forwards, self->total_bytes_forwarded);
+    printf("  Corrupted:        %d packets\n", self->total_messages_corrupted);
+    printf("  Buffer overflows: %d events, %d bytes dropped\n", self->buffer_overflow_events, self->total_bytes_dropped);
+    printf("  Peak occupancy:   %d / %d bytes\n", self->max_buffer_usage, MEM_BUFFER_SIZE);
+    printf("  Deadline misses:  %d\n", self->forwarding_deadline_misses);
+    printf("  Watchdog triggers:%d\n", self->forwarding_watchdog_triggers);
+    printf("  Max exec lag:     %.3f ms\n", self->max_execution_lag / 1000.0);
+    printf("====================================\n");
   =}
 }

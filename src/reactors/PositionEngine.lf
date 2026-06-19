@@ -17,7 +17,7 @@ reactor PositionEngine {
   
   state position_x: double = 0.0
   state position_y: double = 0.0
-  state last_update: time = 0
+  state last_update: instant_t = 0
   state total_latency: interval_t = 0
   state packet_count: int = 0
   state min_latency: interval_t = 0
@@ -78,48 +78,46 @@ reactor PositionEngine {
     lf_schedule_copy(processing_complete, processing_delay, &rtcm_stream->value, 1);
   =} deadline(60 msec) {=
     self->deadline_misses++;
-    interval_t elapsed = lf_time_physical() - lf_time_logical();   
   =}
   
   reaction(processing_complete) {=
-    // LF TIME TRACKING: Measure execution lag at completion
     instant_t logical_now = lf_time_logical();
-    instant_t physical_now = lf_time_physical();
-    interval_t completion_lag = physical_now - logical_now;
-    
-    interval_t elapsed = logical_now - self->last_update;
-    instant_t current_time = lf_time_logical();
     instant_t generation_time = processing_complete->value.generation_time;
-    interval_t latency = current_time - generation_time;
+    interval_t latency = logical_now - generation_time;
     
     self->packet_count++;
     self->total_latency += latency;
     
-    if (self->packet_count == 1 || latency < self->min_latency) {
+    if (self->packet_count == 1 || latency < self->min_latency)
       self->min_latency = latency;
-    }
-    if (self->packet_count == 1 || latency > self->max_latency) {
+    if (self->packet_count == 1 || latency > self->max_latency)
       self->max_latency = latency;
-    }
-    
-    interval_t avg_latency = self->total_latency / self->packet_count;
-    
+
     // Simulate position calculation result
     self->position_x += 0.1;
     self->position_y += 0.05;
-
-    self->last_update = lf_time_logical();
+    self->last_update = logical_now;
   =} deadline(60 msec) {=
     // LF DEADLINE HANDLER: Processing completion took too long
     self->deadline_misses++;
-    interval_t elapsed = lf_time_physical() - lf_time_logical();
   =}
   
   reaction(shutdown) {=
+    printf("\n=== PositionEngine Shutdown Report ===\n");
+    printf("  Packets processed: %d\n", self->packet_count);
+    if (self->packet_count > 0) {
+      printf("  Latency (ms):  min=%.3f  avg=%.3f  max=%.3f\n",
+             self->min_latency / 1000.0,
+             (double)self->total_latency / self->packet_count / 1000.0,
+             self->max_latency / 1000.0);
+    }
     if (self->execution_lag_count > 0) {
-      double avg_lag = (double)self->execution_lag_sum / self->execution_lag_count;
-      // Schedulability analysis
-      double utilization = avg_lag / 100000.0;  // Assume 100ms period
-      }
+      printf("  Exec lag (ms): avg=%.3f  max=%.3f\n",
+             (double)self->execution_lag_sum / self->execution_lag_count / 1000.0,
+             self->max_execution_lag / 1000.0);
+    }
+    printf("  Deadline misses:  %d / %d\n", self->deadline_misses, self->total_processing_tasks);
+    printf("  Watchdog triggers: %d\n", self->watchdog_triggers);
+    printf("======================================\n");
   =}
 }
