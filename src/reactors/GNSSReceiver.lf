@@ -211,6 +211,18 @@ static inline void build_demo_gnss_packet(data_packet_t* packet,
  * @param validation_epochs           Number of epochs in Phase 2 (zero-overflow validation).
  * @param sweep_epochs                Number of epochs in Phase 3 (threshold sweep); 0 disables.
  */
+  /**
+   * @brief Serialise a complete E2E packet into individual UART bytes.
+   *
+   * Iterates over every byte in the buffered E2E packet and schedules a
+   * separate @c emit_byte action for each, offset by the real UART byte
+   * time (10 bits / baudrate).  The generation timestamp is forwarded on
+   * the first byte; packet metadata is preserved on the last byte so that
+   * downstream reactors retain full observability.
+   *
+   * @param emit_e2e  Trigger carrying the fully-formed @c data_packet_t.
+   * @param emit_byte Output action; one event per byte, spaced by byte_time_us.
+   */
 reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
                      max_bytes: int = 800,  // Quad-constellation maximum
                      min_rtcm_messages_per_e2e: int = 1,
@@ -232,7 +244,7 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
     srand(time(NULL));
   =}
   
-  reaction(epoch) -> emit_e2e {=
+  reaction(epoch) -> rtcm {=
     int total_epochs = self->convergence_epochs + self->validation_epochs + self->sweep_epochs;
     // Stop after all phases complete.
     if (total_epochs > 0 && self->epoch_count >= total_epochs) {
@@ -258,81 +270,60 @@ reactor GNSSReceiver(min_bytes: int = 400,  // Dual-constellation baseline
     printf("[t=%lld ms] [EPOCH_%d] GNSS generating 1 E2E message\n",
            lf_time_logical() / MSEC(1), self->epoch_count);
 
-    {
-      self->e2e_counter = (self->e2e_counter + 1) & 0xFFFF;  // 16-bit wrap: 65535 -> 0
+    self->e2e_counter = (self->e2e_counter + 1) & 0xFFFF;  // 16-bit wrap: 65535 -> 0
 
-      int min_rtcm = self->min_rtcm_messages_per_e2e;
-      int max_rtcm = self->max_rtcm_messages_per_e2e;
-      if (min_rtcm < 1) {
-        min_rtcm = 1;
-      }
-      if (max_rtcm < min_rtcm) {
-        max_rtcm = min_rtcm;
-      }
-
-      int rtcm_count = min_rtcm +
-        (rand() % (max_rtcm - min_rtcm + 1));
-
-      data_packet_t packet;
-      int bytes_this_e2e = self->min_bytes + (rand() % (self->max_bytes - self->min_bytes + 1));
-
-      build_demo_gnss_packet(&packet,
-                             (uint16_t)self->e2e_counter,
-                             0x474E5353,
-                             rtcm_count,
-                             bytes_this_e2e,
-                             lf_time_logical());
-
-      lf_schedule_copy(emit_e2e, 0, &packet, 1);
-
-      printf("[t=%lld ms]   E2E#%d: %d bytes, %d RTCM3 messages\n",
-             lf_time_logical() / MSEC(1),
-             self->e2e_counter,
-             packet.bytes,
-             packet.packet_info.rtcm_count);
+    int min_rtcm = self->min_rtcm_messages_per_e2e;
+    int max_rtcm = self->max_rtcm_messages_per_e2e;
+    if (min_rtcm < 1) {
+      min_rtcm = 1;
     }
-  =}
+    if (max_rtcm < min_rtcm) {
+      max_rtcm = min_rtcm;
+    }
 
-  /**
-   * @brief Serialise a complete E2E packet into individual UART bytes.
-   *
-   * Iterates over every byte in the buffered E2E packet and schedules a
-   * separate @c emit_byte action for each, offset by the real UART byte
-   * time (10 bits / baudrate).  The generation timestamp is forwarded on
-   * the first byte; packet metadata is preserved on the last byte so that
-   * downstream reactors retain full observability.
-   *
-   * @param emit_e2e  Trigger carrying the fully-formed @c data_packet_t.
-   * @param emit_byte Output action; one event per byte, spaced by byte_time_us.
-   */
-  reaction(emit_e2e) -> emit_byte {=
+    int rtcm_count = min_rtcm +
+      (rand() % (max_rtcm - min_rtcm + 1));
+
+    data_packet_t packet;
+    int bytes_this_e2e = self->min_bytes + (rand() % (self->max_bytes - self->min_bytes + 1));
+
+    build_demo_gnss_packet(&packet,
+                            (uint16_t)self->e2e_counter,
+                            0x474E5353,
+                            rtcm_count,
+                            bytes_this_e2e,
+                            lf_time_logical());
+
+    // lf_schedule_copy(emit_e2e, 0, &packet, 1);
+
+    printf("[t=%lld ms]   E2E#%d: %d bytes, %d RTCM3 messages\n",
+            lf_time_logical() / MSEC(1),
+            self->e2e_counter,
+            packet.bytes,
+            packet.packet_info.rtcm_count);
+
     // Emit bytes one-by-one so UARTDriver consumes one byte per event.
     // Spacing matches real UART byte time: 10 bits / baudrate.
     // UART framing: 1 start + 8 data + 1 stop = 10 bits per byte.
     int byte_time_us = (10 * 1000000) / self->baudrate;
-    const data_packet_t* packet = &emit_e2e->value;
-    for (int i = 0; i < packet->bytes; i++) {
+    // const data_packet_t* packet = &emit_e2e->value;
+    for (int i = 0; i < packet.bytes; i++) {
       data_packet_t one_byte = {
         .bytes = 1
       };
-      one_byte.data[0] = packet->data[i];
+      one_byte.data[0] = packet.data[i];
 
       // Carry generation timestamp once per packet (on first byte).
       if (i == 0) {
-        one_byte.generation_time = packet->generation_time;
+        one_byte.generation_time = packet.generation_time;
       }
 
       // Preserve packet metadata on final byte to keep observability downstream.
-      if (i == packet->bytes - 1) {
-        one_byte.packet_info = packet->packet_info;
+      if (i == packet.bytes - 1) {
+        one_byte.packet_info = packet.packet_info;
       }
 
-      lf_schedule_copy(emit_byte, USEC(i * byte_time_us), &one_byte, 1);
+      lf_set(emit_byte, USEC(i * byte_time_us), &one_byte, 1);
     }
-  =}
-
-  reaction(emit_byte) -> rtcm {=
-    // Forward exactly one byte packet to UARTDriver.
-    lf_set(rtcm, emit_byte->value);
   =}
 }
